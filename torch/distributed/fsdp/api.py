@@ -61,6 +61,8 @@ class ShardingStrategy(Enum):
       nodes. This is like ``HYBRID_SHARD``, except this may provide even higher throughput
       since the unsharded parameters are not freed after the forward pass, saving the
       all-gathers in the pre-backward.
+    - ``ROUND_ROBIN_SHARD``: Each rank owns a subset of individual parameters in round-robin fashion
+      rather than sharding each parameter. This distributes complete parameters across ranks.
     """
 
     FULL_SHARD = auto()
@@ -68,6 +70,7 @@ class ShardingStrategy(Enum):
     NO_SHARD = auto()
     HYBRID_SHARD = auto()
     _HYBRID_SHARD_ZERO2 = auto()
+    ROUND_ROBIN_SHARD = auto()
 
 
 class BackwardPrefetch(Enum):

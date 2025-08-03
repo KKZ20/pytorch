@@ -44,6 +44,7 @@ __all__ = [
     "ParamInfo",
     "SharedParamInfo",
     "HandleShardingStrategy",
+    "_RoundRobinParamInfo",
 ]
 
 logger = logging.getLogger(__name__)
@@ -107,11 +108,13 @@ class HandleShardingStrategy(Enum):
     NO_SHARD = auto()
     HYBRID_SHARD = auto()
     _HYBRID_SHARD_ZERO2 = auto()
+    ROUND_ROBIN_SHARD = auto()
 
 
 RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES = (
     HandleShardingStrategy.FULL_SHARD,
     HandleShardingStrategy.HYBRID_SHARD,
+    HandleShardingStrategy.ROUND_ROBIN_SHARD,
 )
 NO_RESHARD_AFTER_FORWARD_HANDLE_STRATEGIES = (
     HandleShardingStrategy.SHARD_GRAD_OP,
@@ -159,6 +162,14 @@ class _ShardParamInfo(NamedTuple):
     # `param.as_strided((param.numel(),), (1,))[intra_param_start_idx : intra_param_end_idx + 1]`
     intra_param_start_idx: Optional[int]
     intra_param_end_idx: Optional[int]  # inclusive
+
+
+class _RoundRobinParamInfo(NamedTuple):
+    """Round-robin parameter ownership information."""
+    
+    param_index: int  # Index of parameter in the original parameter list
+    owner_rank: int   # Which rank owns this parameter
+    is_local: bool    # Whether this rank owns this parameter
 
 
 class FlatParamShardMetadata(NamedTuple):
@@ -585,6 +596,10 @@ class FlatParamHandle:
             else 0
         )
         self._fsdp_extension = fsdp_extension
+        # Round-robin parameter ownership tracking
+        self._round_robin_param_infos: Optional[list[_RoundRobinParamInfo]] = None
+        if self._sharding_strategy == HandleShardingStrategy.ROUND_ROBIN_SHARD:
+            self._init_round_robin_param_infos(params)
         self._init_flat_param_and_metadata(
             params,
             fully_sharded_module,
@@ -613,6 +628,23 @@ class FlatParamHandle:
             if align_addresses
             else self._get_unflat_views_unaligned
         )
+
+    def _init_round_robin_param_infos(
+        self,
+        params: Sequence[Union[nn.Parameter, Tensor]],
+    ) -> None:
+        """Initialize round-robin parameter ownership information."""
+        self._round_robin_param_infos = []
+        for param_index, param in enumerate(params):
+            owner_rank = param_index % self.world_size
+            is_local = owner_rank == self.rank
+            self._round_robin_param_infos.append(
+                _RoundRobinParamInfo(
+                    param_index=param_index,
+                    owner_rank=owner_rank,
+                    is_local=is_local,
+                )
+            )
 
     def _init_flat_param_and_metadata(
         self,
@@ -928,6 +960,16 @@ class FlatParamHandle:
         flat_param = self.flat_param
         if not self.uses_sharded_strategy:
             self._init_shard_metadata(0, 0, flat_param.numel() - 1)
+        elif self._sharding_strategy == HandleShardingStrategy.ROUND_ROBIN_SHARD:
+            # For round-robin sharding, create a shard containing only local parameters
+            sharded_flat_param = self._get_round_robin_shard(flat_param)
+            if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
+                allocated = flat_param._typed_storage()._size() > 0
+                if allocated:
+                    flat_param._typed_storage()._resize_(0)
+            flat_param.set_(sharded_flat_param)  # type: ignore[call-overload]
+            # For round-robin, we don't use traditional start/end indices
+            self._init_shard_metadata(0, 0, sharded_flat_param.numel() - 1)
         else:
             _p_assert(
                 flat_param.storage_offset() == 0,
@@ -1105,6 +1147,124 @@ class FlatParamHandle:
         if numel_to_pad > 0:
             shard = F.pad(shard, [0, numel_to_pad])
         return shard, numel_to_pad
+
+    def _get_round_robin_shard(self, flat_param: FlatParameter) -> Tensor:
+        """
+        Create a shard containing only the parameters owned by this rank in round-robin fashion.
+        
+        Returns a tensor containing the concatenated local parameters for round-robin sharding.
+        """
+        if self._round_robin_param_infos is None:
+            raise RuntimeError("Round-robin parameter info not initialized")
+        
+        # Get the parameters that belong to this rank
+        local_param_tensors = []
+        param_offset = 0
+        
+        for param_info in self._round_robin_param_infos:
+            if param_info.is_local:
+                # Find the parameter in the flat parameter
+                param_numel = flat_param._numels[param_info.param_index]
+                param_start = sum(flat_param._numels[:param_info.param_index])
+                param_end = param_start + param_numel
+                
+                # Extract this parameter from the flat parameter
+                param_data = flat_param.data[param_start:param_end].clone()
+                local_param_tensors.append(param_data)
+        
+        if not local_param_tensors:
+            # This rank owns no parameters - create empty tensor with same dtype/device
+            return torch.empty(0, dtype=flat_param.dtype, device=flat_param.device)
+        
+        # Concatenate all local parameters
+        return torch.cat(local_param_tensors, dim=0)
+
+    def _round_robin_all_gather(self) -> Tensor:
+        """
+        All-gather parameters from all ranks for round-robin sharding.
+        
+        Each rank sends its local parameters to all other ranks, and we 
+        reconstruct the full parameter tensor in the original order.
+        """
+        if self._round_robin_param_infos is None:
+            raise RuntimeError("Round-robin parameter info not initialized")
+        
+        # Get the local shard (parameters owned by this rank)
+        local_shard = self.flat_param.data
+        
+        # All-gather the local shards from all ranks
+        gathered_shards = [torch.empty_like(local_shard) for _ in range(self.world_size)]
+        gathered_shards[self.rank] = local_shard
+        
+        pg = (
+            self._fake_process_group
+            if self._use_fake_all_gather
+            else self.process_group
+        )
+        
+        if not self._use_fake_all_gather:
+            dist.all_gather(gathered_shards, local_shard, group=pg)
+        
+        # Reconstruct the full parameter tensor in original order
+        full_param_tensors = [None] * len(self._round_robin_param_infos)
+        
+        for rank in range(self.world_size):
+            rank_shard = gathered_shards[rank]
+            rank_param_offset = 0
+            
+            for param_info in self._round_robin_param_infos:
+                if param_info.owner_rank == rank:
+                    param_numel = self.flat_param._numels[param_info.param_index]
+                    param_data = rank_shard[rank_param_offset:rank_param_offset + param_numel]
+                    full_param_tensors[param_info.param_index] = param_data
+                    rank_param_offset += param_numel
+        
+        # Concatenate all parameters in original order
+        return torch.cat([tensor for tensor in full_param_tensors if tensor is not None], dim=0)
+
+    def _round_robin_unshard_grad(self, flat_param: FlatParameter) -> None:
+        """
+        Unshard gradients for round-robin sharding strategy.
+        
+        Collects gradients from all ranks and reconstructs the full gradient tensor.
+        """
+        if self._round_robin_param_infos is None:
+            raise RuntimeError("Round-robin parameter info not initialized")
+        
+        # Save the current sharded gradient
+        if flat_param.grad is None:
+            flat_param._saved_grad_shard = None  # type: ignore[assignment]
+            # Create zero gradients for missing gradients
+            local_grad_shard = torch.zeros_like(self.flat_param.data)
+        else:
+            flat_param._saved_grad_shard = flat_param.grad  # type: ignore[attr-defined]
+            local_grad_shard = flat_param.grad
+        
+        # All-gather the local gradient shards from all ranks
+        gathered_grad_shards = [torch.empty_like(local_grad_shard) for _ in range(self.world_size)]
+        gathered_grad_shards[self.rank] = local_grad_shard
+        
+        if not self._use_fake_all_gather:
+            dist.all_gather(gathered_grad_shards, local_grad_shard, group=self.process_group)
+        
+        # Reconstruct the full gradient tensor in original order
+        full_grad_tensors = [None] * len(self._round_robin_param_infos)
+        
+        for rank in range(self.world_size):
+            rank_grad_shard = gathered_grad_shards[rank]
+            rank_grad_offset = 0
+            
+            for param_info in self._round_robin_param_infos:
+                if param_info.owner_rank == rank:
+                    param_numel = self.flat_param._numels[param_info.param_index]
+                    param_grad_data = rank_grad_shard[rank_grad_offset:rank_grad_offset + param_numel]
+                    full_grad_tensors[param_info.param_index] = param_grad_data
+                    rank_grad_offset += param_numel
+        
+        # Concatenate all gradients in original order
+        unsharded_size = self.flat_param._unpadded_unsharded_size
+        full_grad = torch.cat([tensor for tensor in full_grad_tensors if tensor is not None], dim=0)
+        flat_param.grad = full_grad.view(unsharded_size)
 
     @staticmethod
     def _get_sharded_size(tensor: Tensor, rank: int, world_size: int) -> torch.Size:
@@ -1342,9 +1502,15 @@ class FlatParamHandle:
             )
             self._use_unsharded_flat_param(unsharded_flat_param)
             return
-        unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
-        padded_unsharded_flat_param = self._all_gather_flat_param(unsharded_flat_param)
-        self._use_unsharded_flat_param(padded_unsharded_flat_param)
+        
+        if self._sharding_strategy == HandleShardingStrategy.ROUND_ROBIN_SHARD:
+            # For round-robin, gather all parameters from all ranks
+            unsharded_flat_param = self._round_robin_all_gather()
+        else:
+            unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
+            padded_unsharded_flat_param = self._all_gather_flat_param(unsharded_flat_param)
+            unsharded_flat_param = padded_unsharded_flat_param
+        self._use_unsharded_flat_param(unsharded_flat_param)
 
     def needs_unshard(self) -> bool:
         """Return if the handle's flat parameter needs to be unsharded."""
@@ -1539,33 +1705,37 @@ class FlatParamHandle:
             self._use_unsharded_grad_views()
             return
 
-        if flat_param.grad is None:
-            # In the case that only some ranks have `None` gradient, we use
-            # zeros to approximate as a best effort attempt
-            if self._debug_level == dist.DebugLevel.INFO:
-                warnings.warn(
-                    f"[Rank {self.rank}] Only some but not all ranks have a "
-                    "`None` `FlatParameter` gradient, so FSDP is using zeros to "
-                    "approximate those ranks' sharded gradients being `None`"
-                )
-            flat_param._saved_grad_shard = None  # type: ignore[assignment]
-            sharded_grad = torch.zeros(flat_param._sharded_size, device=self.device)  # type: ignore[attr-defined]
+        if self._sharding_strategy == HandleShardingStrategy.ROUND_ROBIN_SHARD:
+            # For round-robin, we need to gather gradients differently
+            self._round_robin_unshard_grad(flat_param)
         else:
-            self._check_sharded(flat_param.grad)
-            flat_param._saved_grad_shard = flat_param.grad  # type: ignore[attr-defined]
-            sharded_grad = flat_param._saved_grad_shard  # type: ignore[attr-defined]
-        padded_unsharded_grad = torch.empty(
-            flat_param._padded_unsharded_size,  # type: ignore[attr-defined]
-            device=self.device,
-            dtype=sharded_grad.dtype,
-        )
-        dist.all_gather_into_tensor(
-            padded_unsharded_grad, sharded_grad, self.process_group
-        )
-        unsharded_size = self.flat_param._unpadded_unsharded_size
-        flat_param.grad = padded_unsharded_grad[: unsharded_size.numel()].view(
-            unsharded_size
-        )
+            if flat_param.grad is None:
+                # In the case that only some ranks have `None` gradient, we use
+                # zeros to approximate as a best effort attempt
+                if self._debug_level == dist.DebugLevel.INFO:
+                    warnings.warn(
+                        f"[Rank {self.rank}] Only some but not all ranks have a "
+                        "`None` `FlatParameter` gradient, so FSDP is using zeros to "
+                        "approximate those ranks' sharded gradients being `None`"
+                    )
+                flat_param._saved_grad_shard = None  # type: ignore[assignment]
+                sharded_grad = torch.zeros(flat_param._sharded_size, device=self.device)  # type: ignore[attr-defined]
+            else:
+                self._check_sharded(flat_param.grad)
+                flat_param._saved_grad_shard = flat_param.grad  # type: ignore[attr-defined]
+                sharded_grad = flat_param._saved_grad_shard  # type: ignore[attr-defined]
+            padded_unsharded_grad = torch.empty(
+                flat_param._padded_unsharded_size,  # type: ignore[attr-defined]
+                device=self.device,
+                dtype=sharded_grad.dtype,
+            )
+            dist.all_gather_into_tensor(
+                padded_unsharded_grad, sharded_grad, self.process_group
+            )
+            unsharded_size = self.flat_param._unpadded_unsharded_size
+            flat_param.grad = padded_unsharded_grad[: unsharded_size.numel()].view(
+                unsharded_size
+            )
         self._use_unsharded_grad_views()
 
     def reshard_grad(self):
